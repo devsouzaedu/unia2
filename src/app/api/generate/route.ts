@@ -1,8 +1,19 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from "next/server";
 import Replicate from "replicate";
 import FormData from "form-data";
 import fetch from "node-fetch";
+
+// Função auxiliar para converter um ReadableStream em Buffer
+async function streamToBuffer(stream: ReadableStream): Promise<Buffer> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
+}
 
 export async function POST(request: Request) {
   try {
@@ -21,9 +32,7 @@ export async function POST(request: Request) {
 
     console.log("Imagem recebida com sucesso, convertendo para base64...");
     const arrayBuffer = await image.arrayBuffer();
-    const base64Image = `data:image/jpeg;base64,${Buffer.from(arrayBuffer).toString(
-      "base64"
-    )}`;
+    const base64Image = `data:image/jpeg;base64,${Buffer.from(arrayBuffer).toString("base64")}`;
 
     console.log("Enviando a imagem para o modelo ControlNet...");
 
@@ -31,8 +40,8 @@ export async function POST(request: Request) {
       auth: process.env.REPLICATE_API_TOKEN,
     });
 
-    // Força o retorno para string[] com cast
-    const output = (await replicate.run(
+    // Executa o modelo no Replicate
+    const outputRaw: unknown = await replicate.run(
       "jagilley/controlnet-canny:aff48af9c68d162388d230a2ab003f68d2638d88307bdaf1c2f1ac95079c9613",
       {
         input: {
@@ -45,25 +54,56 @@ export async function POST(request: Request) {
           num_outputs: 1,
         },
       }
-    )) as unknown as string[];
+    );
 
-    if (!Array.isArray(output) || typeof output[0] !== "string") {
+    console.log("Resposta do Replicate (outputRaw):", outputRaw);
+
+    // Converter o output para um array de Buffer
+    let output: Buffer[] = [];
+
+    if (
+      Array.isArray(outputRaw) &&
+      outputRaw.length > 0 &&
+      typeof (outputRaw[0] as any).getReader === "function"
+    ) {
+      // Se for um array de ReadableStream, converte cada stream em Buffer
+      output = await Promise.all(
+        (outputRaw as ReadableStream[]).map(async (stream) => {
+          const buf = await streamToBuffer(stream);
+          return buf;
+        })
+      );
+    } else if (typeof outputRaw === "string") {
+      // Se for uma string (menos provável para dados binários)
+      output = [Buffer.from(outputRaw, "binary")];
+    } else if (Array.isArray(outputRaw) && typeof outputRaw[0] === "string") {
+      output = (outputRaw as string[]).map((s) => Buffer.from(s, "binary"));
+    } else if (
+      typeof outputRaw === "object" &&
+      outputRaw !== null &&
+      "output" in outputRaw
+    ) {
+      const maybeOutput = (outputRaw as any).output;
+      if (Array.isArray(maybeOutput) && typeof maybeOutput[0] === "string") {
+        output = maybeOutput.map((s: string) => Buffer.from(s, "binary"));
+      } else {
+        throw new Error(
+          "Unexpected output format: propriedade 'output' não é um array de strings"
+        );
+      }
+    } else {
       throw new Error("Unexpected output format");
     }
 
-    console.log("Iniciando o upload das imagens geradas para o Cloudinary...");
+    console.log("Formato esperado confirmado. Output length:", output.length);
+    console.log("Iniciando o upload das imagens para o Cloudinary...");
 
+    // Para cada buffer, realiza o upload para o Cloudinary
     const urls: string[] = await Promise.all(
-      output.map(async (blobUrl: string) => {
-        if (typeof blobUrl !== "string") {
-          throw new Error("Unexpected blobUrl type");
-        }
-        // Converte a URL em buffer
-        const response = await fetch(blobUrl);
-        const buffer = await response.buffer();
-
+      output.map(async (buffer: Buffer) => {
         const cloudinaryForm = new FormData();
-        cloudinaryForm.append("file", buffer, "unha.jpg");
+        // Usamos o buffer diretamente como conteúdo do arquivo
+        cloudinaryForm.append("file", buffer, "unha.png");
         cloudinaryForm.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET!);
 
         const uploadResponse = await fetch(
