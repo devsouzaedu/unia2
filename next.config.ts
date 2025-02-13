@@ -8,6 +8,9 @@ const nextConfig: NextConfig = {
   typescript: {
     ignoreBuildErrors: true,  // Ignora erros de TypeScript no build
   },
+  images: {
+    domains: ['res.cloudinary.com'],
+  },
 };
 
 

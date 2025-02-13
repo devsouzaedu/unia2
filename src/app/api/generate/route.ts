@@ -17,48 +17,50 @@ async function streamToBuffer(stream: ReadableStream): Promise<Buffer> {
 
 export async function POST(request: Request) {
   try {
-    console.log("Recebendo a requisição de imagem...");
+    console.log("Receiving image request...");
 
     const formData = await request.formData();
     const image = formData.get("image");
+    const userPrompt = formData.get("prompt")?.toString() || "";
 
     if (!image || !(image instanceof File)) {
-      console.error("Nenhuma imagem foi enviada ou o tipo é inválido.");
+      console.error("No image was sent or the file type is invalid.");
       return NextResponse.json(
-        { error: "Nenhuma imagem foi enviada ou o tipo é inválido." },
+        { error: "No image was sent or the file type is invalid." },
         { status: 400 }
       );
     }
 
-    console.log("Imagem recebida com sucesso, convertendo para base64...");
+    console.log("Image received successfully, converting to base64...");
     const arrayBuffer = await image.arrayBuffer();
     const base64Image = `data:image/jpeg;base64,${Buffer.from(arrayBuffer).toString("base64")}`;
 
-    console.log("Enviando a imagem para o modelo ControlNet...");
+    // Novo finalPrompt que mescla a entrada do usuário com instruções fixas
+    const finalPrompt = `Using the submitted hand photo, modify only the nail polish on the five nails. DO NOT change any part of the hand (including skin tone, texture, or details). Apply the following design exclusively to the nails: ${userPrompt}. The hand must remain exactly as in the original photo.`;
+    console.log("Final prompt:", finalPrompt);
 
+    console.log("Sending the image to the ControlNet model...");
     const replicate = new Replicate({
       auth: process.env.REPLICATE_API_TOKEN,
     });
 
-    // Executa o modelo no Replicate
     const outputRaw: unknown = await replicate.run(
       "jagilley/controlnet-canny:aff48af9c68d162388d230a2ab003f68d2638d88307bdaf1c2f1ac95079c9613",
       {
         input: {
           image: base64Image,
-          prompt:
-            "A female hand with 10 fingers, close-up, with fingernails designed based on the inspiration image. Focus on the fingernails and their style, color, and texture. No faces, no backgrounds.",
-          negative_prompt:
-            "faces, full body, background, blurry, multiple people, objects unrelated to nails",
-          guidance_scale: 7.5,
+          prompt: finalPrompt,
+          // Negative prompt reforçado para evitar que a mão seja alterada
+          negative_prompt: "hand, skin, face, full body, background, non-nail areas",
+          guidance_scale: 1,
           num_outputs: 1,
         },
       }
     );
 
-    console.log("Resposta do Replicate (outputRaw):", outputRaw);
+    console.log("Replicate response (outputRaw):", outputRaw);
 
-    // Converter o output para um array de Buffer
+    // Converter o output recebido para um array de Buffer
     let output: Buffer[] = [];
 
     if (
@@ -69,12 +71,10 @@ export async function POST(request: Request) {
       // Se for um array de ReadableStream, converte cada stream em Buffer
       output = await Promise.all(
         (outputRaw as ReadableStream[]).map(async (stream) => {
-          const buf = await streamToBuffer(stream);
-          return buf;
+          return await streamToBuffer(stream);
         })
       );
     } else if (typeof outputRaw === "string") {
-      // Se for uma string (menos provável para dados binários)
       output = [Buffer.from(outputRaw, "binary")];
     } else if (Array.isArray(outputRaw) && typeof outputRaw[0] === "string") {
       output = (outputRaw as string[]).map((s) => Buffer.from(s, "binary"));
@@ -88,43 +88,53 @@ export async function POST(request: Request) {
         output = maybeOutput.map((s: string) => Buffer.from(s, "binary"));
       } else {
         throw new Error(
-          "Unexpected output format: propriedade 'output' não é um array de strings"
+          "Unexpected output format: 'output' property is not an array of strings"
         );
       }
     } else {
       throw new Error("Unexpected output format");
     }
 
-    console.log("Formato esperado confirmado. Output length:", output.length);
-    console.log("Iniciando o upload das imagens para o Cloudinary...");
+    console.log("Expected format confirmed. Output length:", output.length);
 
-    // Para cada buffer, realiza o upload para o Cloudinary
-    const urls: string[] = await Promise.all(
-      output.map(async (buffer: Buffer) => {
-        const cloudinaryForm = new FormData();
-        // Usamos o buffer diretamente como conteúdo do arquivo
-        cloudinaryForm.append("file", buffer, "unha.png");
-        cloudinaryForm.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET!);
+    // Se receber mais de uma imagem, escolhe a de maior tamanho (em bytes)
+    let chosenBuffer: Buffer;
+    if (output.length > 1) {
+      chosenBuffer = output.reduce((prev, curr) =>
+        curr.length > prev.length ? curr : prev
+      );
+    } else {
+      chosenBuffer = output[0];
+    }
 
-        const uploadResponse = await fetch(
-          `https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload`,
-          {
-            method: "POST",
-            body: cloudinaryForm,
-          }
-        );
+    console.log("Chosen buffer for upload, size:", chosenBuffer.length);
+    console.log("Uploading the image to Cloudinary...");
 
-        const uploadResult = await uploadResponse.json();
-        console.log("Resposta do Cloudinary:", uploadResult);
-
-        return uploadResult.secure_url || null;
-      })
+    const cloudinaryForm = new FormData();
+    cloudinaryForm.append("file", chosenBuffer, "nail.png");
+    cloudinaryForm.append(
+      "upload_preset",
+      process.env.CLOUDINARY_UPLOAD_PRESET!
     );
 
-    console.log("Imagens carregadas com sucesso no Cloudinary:", urls.filter(Boolean));
-    return NextResponse.json({ urls: urls.filter(Boolean) });
+    const uploadResponse = await fetch(
+      `https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload`,
+      {
+        method: "POST",
+        body: cloudinaryForm,
+      }
+    );
+
+    const uploadResult = await uploadResponse.json();
+    console.log("Cloudinary response:", uploadResult);
+
+    // Return only the URL of the chosen image
+    return NextResponse.json({ urls: [uploadResult.secure_url] });
   } catch (error) {
-    console.error("Erro inesperado no servidor:", error);
-    return NextResponse.json({ error: "Erro interno no servidor." }, { status: 500 });
+    console.error("Unexpected server error:", error);
+    return NextResponse.json(
+      { error: "Internal server error." },
+      { status: 500 }
+    );
   }
 }
