@@ -1,4 +1,3 @@
-// app/generate-job/route.tsx
 import { NextResponse } from "next/server";
 import Replicate from "replicate";
 import FormData from "form-data";
@@ -44,20 +43,32 @@ async function streamToBuffer(stream: ReadableStream): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-// Função que processa a imagem, envia para o modelo e faz upload no Cloudinary
+// Função que processa a imagem e inclui logs de tempo para cada etapa
 async function processImage(image: File, userPrompt: string): Promise<string> {
-  const originalBuffer = Buffer.from(await image.arrayBuffer());
+  console.log("=== Iniciando processImage ===");
+  const overallStart = Date.now();
 
+  // Conversão da imagem para Buffer
+  const conversionStart = Date.now();
+  const originalBuffer = Buffer.from(await image.arrayBuffer());
+  console.log(`Conversão para Buffer: ${Date.now() - conversionStart} ms`);
+
+  // Redimensionamento da imagem
+  const resizeStart = Date.now();
   const resizedBuffer = await sharp(originalBuffer)
     .resize({ width: 500, withoutEnlargement: true })
     .toBuffer();
+  console.log(`Redimensionamento: ${Date.now() - resizeStart} ms`);
 
+  // Converter o buffer redimensionado para base64
   const base64Image = `data:image/jpeg;base64,${resizedBuffer.toString("base64")}`;
 
+  // Compor o prompt final
   const finalPrompt = `Using the submitted hand photo, modify only the nail polish on the five nails. DO NOT change any part of the hand (including skin tone, texture, or details). Apply the following design exclusively to the nails: ${userPrompt}. The hand must remain exactly as in the original photo.`;
   console.log("Final prompt:", finalPrompt);
 
-  console.log("Enviando a imagem para o modelo ControlNet...");
+  // Chamada ao Replicate
+  const replicateStart = Date.now();
   const replicate = new Replicate({
     auth: process.env.REPLICATE_API_TOKEN,
   });
@@ -73,8 +84,9 @@ async function processImage(image: File, userPrompt: string): Promise<string> {
       },
     }
   );
-  console.log("Resposta do Replicate:", outputRaw);
+  console.log(`Chamada ao Replicate: ${Date.now() - replicateStart} ms`);
 
+  // Converter a resposta do Replicate para Buffer(s)
   let output: Buffer[] = [];
   if (
     Array.isArray(outputRaw) &&
@@ -91,8 +103,9 @@ async function processImage(image: File, userPrompt: string): Promise<string> {
   } else {
     throw new Error("Formato de saída inesperado");
   }
-  console.log("Formato esperado confirmado. Número de imagens:", output.length);
+  console.log("Número de imagens obtidas:", output.length);
 
+  // Seleciona o buffer da melhor imagem
   let chosenBuffer: Buffer;
   if (output.length > 1) {
     chosenBuffer = output.reduce((prev, curr) =>
@@ -101,9 +114,10 @@ async function processImage(image: File, userPrompt: string): Promise<string> {
   } else {
     chosenBuffer = output[0];
   }
-  console.log("Buffer escolhido para upload, tamanho:", chosenBuffer.length);
-  console.log("Enviando a imagem para o Cloudinary...");
+  console.log("Buffer escolhido, tamanho:", chosenBuffer.length);
 
+  // Upload da imagem para o Cloudinary
+  const uploadStart = Date.now();
   const cloudinaryForm = new FormData();
   cloudinaryForm.append("file", chosenBuffer, "nail.png");
   cloudinaryForm.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET!);
@@ -116,7 +130,9 @@ async function processImage(image: File, userPrompt: string): Promise<string> {
     }
   );
   const uploadResult = await uploadResponse.json();
-  console.log("Resposta do Cloudinary:", uploadResult);
+  console.log(`Upload para o Cloudinary: ${Date.now() - uploadStart} ms`);
+
+  console.log(`processImage finalizado em ${Date.now() - overallStart} ms`);
   return uploadResult.secure_url;
 }
 
@@ -141,12 +157,14 @@ export async function POST(request: Request) {
     // Processa a imagem em background sem bloquear a resposta
     setTimeout(async () => {
       try {
+        console.log(`=== Iniciando processamento do job ${jobId} ===`);
+        const startTime = Date.now();
         const resultUrl = await processImage(image, userPrompt);
+        console.log(`Job ${jobId} finalizado. Tempo total: ${Date.now() - startTime} ms`);
         await updateJob(jobId, { status: "done", result: resultUrl });
-        console.log("Job", jobId, "completado com resultado:", resultUrl);
       } catch (error) {
         await updateJob(jobId, { status: "error", error: error.toString() });
-        console.error("Job", jobId, "falhou com erro:", error);
+        console.error("Erro no processamento do job", jobId, error);
       }
     }, 0);
 
