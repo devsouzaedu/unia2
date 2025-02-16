@@ -1,32 +1,34 @@
+// app/generate-job/route.tsx
 import { NextResponse } from "next/server";
 import Replicate from "replicate";
 import FormData from "form-data";
 import fetch from "node-fetch";
 import sharp from "sharp";
+import { supabaseAdmin } from "../../../lib/supabaseAdmin";
 
-// Global job store (apenas para demonstração)
-if (!globalThis.jobs) {
-  globalThis.jobs = {};
-}
-const jobs: Record<
-  string,
-  { status: "pending" | "processing" | "done" | "error"; result?: string; error?: string }
-> = globalThis.jobs;
-
-// Funções para manipular jobs
-function createJob(): string {
+// Função para criar um job no Supabase
+async function createJob(): Promise<string> {
   const jobId = Math.random().toString(36).substring(2, 10);
-  jobs[jobId] = { status: "pending" };
+  const { error } = await supabaseAdmin
+    .from("jobs")
+    .insert([{ id: jobId, status: "pending" }]);
+  if (error) {
+    console.error("Erro ao criar job:", error);
+  }
   return jobId;
 }
 
-function updateJob(
+// Função para atualizar um job no Supabase
+async function updateJob(
   jobId: string,
-  update: Partial<{ status: string; result?: string; error?: string }>
+  update: { status?: string; result?: string; error?: string }
 ) {
-  if (jobs[jobId]) {
-    console.log(`Updating job ${jobId} - New Status: ${JSON.stringify(update)}`);
-    jobs[jobId] = { ...jobs[jobId], ...update };
+  const { error } = await supabaseAdmin
+    .from("jobs")
+    .update(update)
+    .eq("id", jobId);
+  if (error) {
+    console.error("Erro ao atualizar job:", error);
   }
 }
 
@@ -42,24 +44,20 @@ async function streamToBuffer(stream: ReadableStream): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-// Função que processa a imagem: redimensiona, envia para o modelo e faz upload no Cloudinary
+// Função que processa a imagem, envia para o modelo e faz upload no Cloudinary
 async function processImage(image: File, userPrompt: string): Promise<string> {
-  // Converte a imagem para Buffer
   const originalBuffer = Buffer.from(await image.arrayBuffer());
 
-  // Redimensiona a imagem para uma largura máxima de 500px (mantendo a proporção)
   const resizedBuffer = await sharp(originalBuffer)
     .resize({ width: 500, withoutEnlargement: true })
     .toBuffer();
 
-  // Converte o buffer redimensionado para base64
   const base64Image = `data:image/jpeg;base64,${resizedBuffer.toString("base64")}`;
 
-  // Compor o prompt final
   const finalPrompt = `Using the submitted hand photo, modify only the nail polish on the five nails. DO NOT change any part of the hand (including skin tone, texture, or details). Apply the following design exclusively to the nails: ${userPrompt}. The hand must remain exactly as in the original photo.`;
   console.log("Final prompt:", finalPrompt);
 
-  console.log("Sending the image to the ControlNet model...");
+  console.log("Enviando a imagem para o modelo ControlNet...");
   const replicate = new Replicate({
     auth: process.env.REPLICATE_API_TOKEN,
   });
@@ -75,9 +73,8 @@ async function processImage(image: File, userPrompt: string): Promise<string> {
       },
     }
   );
-  console.log("Replicate response (outputRaw):", outputRaw);
+  console.log("Resposta do Replicate:", outputRaw);
 
-  // Converter o output para array de Buffer
   let output: Buffer[] = [];
   if (
     Array.isArray(outputRaw) &&
@@ -92,11 +89,10 @@ async function processImage(image: File, userPrompt: string): Promise<string> {
   } else if (Array.isArray(outputRaw) && typeof outputRaw[0] === "string") {
     output = (outputRaw as string[]).map((s) => Buffer.from(s, "binary"));
   } else {
-    throw new Error("Unexpected output format");
+    throw new Error("Formato de saída inesperado");
   }
-  console.log("Expected format confirmed. Output length:", output.length);
+  console.log("Formato esperado confirmado. Número de imagens:", output.length);
 
-  // Se houver mais de uma imagem, escolhe a melhor (maior em tamanho)
   let chosenBuffer: Buffer;
   if (output.length > 1) {
     chosenBuffer = output.reduce((prev, curr) =>
@@ -105,8 +101,8 @@ async function processImage(image: File, userPrompt: string): Promise<string> {
   } else {
     chosenBuffer = output[0];
   }
-  console.log("Chosen buffer for upload, size:", chosenBuffer.length);
-  console.log("Uploading the image to Cloudinary...");
+  console.log("Buffer escolhido para upload, tamanho:", chosenBuffer.length);
+  console.log("Enviando a imagem para o Cloudinary...");
 
   const cloudinaryForm = new FormData();
   cloudinaryForm.append("file", chosenBuffer, "nail.png");
@@ -120,7 +116,7 @@ async function processImage(image: File, userPrompt: string): Promise<string> {
     }
   );
   const uploadResult = await uploadResponse.json();
-  console.log("Cloudinary response:", uploadResult);
+  console.log("Resposta do Cloudinary:", uploadResult);
   return uploadResult.secure_url;
 }
 
@@ -136,27 +132,27 @@ export async function POST(request: Request) {
     const image = formData.get("image");
     const userPrompt = formData.get("prompt")?.toString() || "";
     if (!image || !(image instanceof File)) {
-      return NextResponse.json({ error: "Invalid image" }, { status: 400 });
+      return NextResponse.json({ error: "Imagem inválida" }, { status: 400 });
     }
-    const jobId = createJob();
-    console.log("Job created with ID:", jobId);
+    const jobId = await createJob();
+    console.log("Job criado com ID:", jobId);
     const response = NextResponse.json({ jobId });
 
-    // Processa a imagem em background (sem bloquear a resposta)
+    // Processa a imagem em background sem bloquear a resposta
     setTimeout(async () => {
       try {
         const resultUrl = await processImage(image, userPrompt);
-        updateJob(jobId, { status: "done", result: resultUrl });
-        console.log("Job", jobId, "completed with result:", resultUrl);
+        await updateJob(jobId, { status: "done", result: resultUrl });
+        console.log("Job", jobId, "completado com resultado:", resultUrl);
       } catch (error) {
-        updateJob(jobId, { status: "error", error: error.toString() });
-        console.error("Job", jobId, "failed with error:", error);
+        await updateJob(jobId, { status: "error", error: error.toString() });
+        console.error("Job", jobId, "falhou com erro:", error);
       }
     }, 0);
 
     return response;
   } catch (error) {
-    console.error("Unexpected server error:", error);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    console.error("Erro interno no servidor:", error);
+    return NextResponse.json({ error: "Erro interno no servidor" }, { status: 500 });
   }
 }

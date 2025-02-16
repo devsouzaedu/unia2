@@ -1,24 +1,23 @@
+// api/job-status/route.tsx
 import { NextResponse } from "next/server";
-
-// Garante que o armazenamento global esteja definido
-if (!globalThis.jobs) {
-  globalThis.jobs = {};
-}
-const jobs: Record<
-  string,
-  { status: "pending" | "processing" | "done" | "error"; result?: string; error?: string }
-> = globalThis.jobs;
+import { supabaseAdmin } from "../../../lib/supabaseAdmin";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const jobId = searchParams.get("jobId");
   if (!jobId) {
-    return NextResponse.json({ error: "Missing jobId" }, { status: 400 });
+    return NextResponse.json({ error: "Parâmetro jobId ausente" }, { status: 400 });
   }
-  const job = jobs[jobId];
-  console.log(`Checking job ${jobId} - Current Status: ${JSON.stringify(job)}`);
-  if (!job) {
-    return NextResponse.json({ error: "Job not found" }, { status: 404 });
+  const { data, error } = await supabaseAdmin
+    .from("jobs")
+    .select("*")
+    .eq("id", jobId)
+    .single();
+
+  if (error || !data) {
+    console.error("Erro ao buscar job:", error);
+    return NextResponse.json({ error: "Job não encontrado" }, { status: 404 });
   }
-  return NextResponse.json(job);
+  console.log(`Checando job ${jobId} - Status atual: ${JSON.stringify(data)}`);
+  return NextResponse.json(data);
 }
