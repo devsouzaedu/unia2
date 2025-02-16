@@ -13,6 +13,7 @@ const jobs: Record<
   { status: "pending" | "processing" | "done" | "error"; result?: string; error?: string }
 > = globalThis.jobs;
 
+// Funções para manipular jobs
 function createJob(): string {
   const jobId = Math.random().toString(36).substring(2, 10);
   jobs[jobId] = { status: "pending" };
@@ -29,6 +30,7 @@ function updateJob(
   }
 }
 
+// Função auxiliar para converter um ReadableStream em Buffer
 async function streamToBuffer(stream: ReadableStream): Promise<Buffer> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
@@ -40,13 +42,20 @@ async function streamToBuffer(stream: ReadableStream): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
+// Função que processa a imagem: redimensiona, envia para o modelo e faz upload no Cloudinary
 async function processImage(image: File, userPrompt: string): Promise<string> {
+  // Converte a imagem para Buffer
   const originalBuffer = Buffer.from(await image.arrayBuffer());
+
+  // Redimensiona a imagem para uma largura máxima de 500px (mantendo a proporção)
   const resizedBuffer = await sharp(originalBuffer)
     .resize({ width: 500, withoutEnlargement: true })
     .toBuffer();
+
+  // Converte o buffer redimensionado para base64
   const base64Image = `data:image/jpeg;base64,${resizedBuffer.toString("base64")}`;
 
+  // Compor o prompt final
   const finalPrompt = `Using the submitted hand photo, modify only the nail polish on the five nails. DO NOT change any part of the hand (including skin tone, texture, or details). Apply the following design exclusively to the nails: ${userPrompt}. The hand must remain exactly as in the original photo.`;
   console.log("Final prompt:", finalPrompt);
 
@@ -68,6 +77,7 @@ async function processImage(image: File, userPrompt: string): Promise<string> {
   );
   console.log("Replicate response (outputRaw):", outputRaw);
 
+  // Converter o output para array de Buffer
   let output: Buffer[] = [];
   if (
     Array.isArray(outputRaw) &&
@@ -86,6 +96,7 @@ async function processImage(image: File, userPrompt: string): Promise<string> {
   }
   console.log("Expected format confirmed. Output length:", output.length);
 
+  // Se houver mais de uma imagem, escolhe a melhor (maior em tamanho)
   let chosenBuffer: Buffer;
   if (output.length > 1) {
     chosenBuffer = output.reduce((prev, curr) =>
@@ -113,6 +124,7 @@ async function processImage(image: File, userPrompt: string): Promise<string> {
   return uploadResult.secure_url;
 }
 
+// Configuração para permitir execuções de até 60 segundos
 export const config = {
   runtime: "nodejs",
   maxDuration: 60,
@@ -130,6 +142,7 @@ export async function POST(request: Request) {
     console.log("Job created with ID:", jobId);
     const response = NextResponse.json({ jobId });
 
+    // Processa a imagem em background (sem bloquear a resposta)
     setTimeout(async () => {
       try {
         const resultUrl = await processImage(image, userPrompt);
