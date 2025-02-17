@@ -1,9 +1,8 @@
 import { NextResponse } from "next/server";
-import Replicate from "replicate";
-import FormData from "form-data";
-import fetch from "node-fetch";
 import sharp from "sharp";
+import fetch from "node-fetch";
 import { supabaseAdmin } from "../../../lib/supabaseAdmin";
+import { generateNailMask } from "../../../lib/generateNailMask";
 
 // Função para criar um job no Supabase
 async function createJob(): Promise<string> {
@@ -31,109 +30,75 @@ async function updateJob(
   }
 }
 
-// Função auxiliar para converter um ReadableStream em Buffer
-async function streamToBuffer(stream: ReadableStream): Promise<Buffer> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-  }
-  return Buffer.concat(chunks);
-}
-
-// Função que processa a imagem e inclui logs de tempo para cada etapa
+// Função que processa a imagem com Stability AI utilizando a máscara automática
 async function processImage(image: File, userPrompt: string): Promise<string> {
-  console.log("=== Iniciando processImage ===");
+  console.log("=== Iniciando processImage com Stability AI ===");
   const overallStart = Date.now();
 
-  // Conversão da imagem para Buffer
+  // Converter a imagem em Buffer
   const conversionStart = Date.now();
   const originalBuffer = Buffer.from(await image.arrayBuffer());
   console.log(`Conversão para Buffer: ${Date.now() - conversionStart} ms`);
 
-  // Redimensionamento da imagem
+  // Redimensionar a imagem para 512x512 para usar como init_image
   const resizeStart = Date.now();
   const resizedBuffer = await sharp(originalBuffer)
-    .resize({ width: 500, withoutEnlargement: true })
+    .resize(512, 512, { fit: "cover" })
+    .jpeg({ quality: 80 })
     .toBuffer();
-  console.log(`Redimensionamento: ${Date.now() - resizeStart} ms`);
+  console.log(`Redimensionamento (init_image): ${Date.now() - resizeStart} ms`);
 
-  // Converter o buffer redimensionado para base64
-  const base64Image = `data:image/jpeg;base64,${resizedBuffer.toString("base64")}`;
+  // Gerar a máscara automática das unhas (usa seu helper)
+  const maskStart = Date.now();
+  const maskBuffer = await generateNailMask(originalBuffer);
+  console.log(`Geração da máscara: ${Date.now() - maskStart} ms`);
+
+  // Converter ambas as imagens para Base64 (data URI)
+  const base64Init = `data:image/jpeg;base64,${resizedBuffer.toString("base64")}`;
+  const base64Mask = `data:image/png;base64,${maskBuffer.toString("base64")}`;
 
   // Compor o prompt final
-  const finalPrompt = `Using the submitted hand photo, modify only the nail polish on the five nails. DO NOT change any part of the hand (including skin tone, texture, or details). Apply the following design exclusively to the nails: ${userPrompt}. The hand must remain exactly as in the original photo.`;
+  const finalPrompt = `Using the submitted hand photo, modify only the nail polish on the five nails. The hand must remain exactly as in the original photo. ${userPrompt}`;
   console.log("Final prompt:", finalPrompt);
 
-  // Chamada ao Replicate
-  const replicateStart = Date.now();
-  const replicate = new Replicate({
-    auth: process.env.REPLICATE_API_TOKEN,
-  });
-  const outputRaw: unknown = await replicate.run(
-    "jagilley/controlnet-canny:aff48af9c68d162388d230a2ab003f68d2638d88307bdaf1c2f1ac95079c9613",
-    {
-      input: {
-        image: base64Image,
-        prompt: finalPrompt,
-        negative_prompt: "hand, skin, face, full body, background, non-nail areas",
-        guidance_scale: 6.5,
-        num_outputs: 1,
-      },
-    }
-  );
-  console.log(`Chamada ao Replicate: ${Date.now() - replicateStart} ms`);
-
-  // Converter a resposta do Replicate para Buffer(s)
-  let output: Buffer[] = [];
-  if (
-    Array.isArray(outputRaw) &&
-    outputRaw.length > 0 &&
-    typeof (outputRaw[0] as any).getReader === "function"
-  ) {
-    output = await Promise.all(
-      (outputRaw as ReadableStream[]).map(async (stream) => await streamToBuffer(stream))
-    );
-  } else if (typeof outputRaw === "string") {
-    output = [Buffer.from(outputRaw, "binary")];
-  } else if (Array.isArray(outputRaw) && typeof outputRaw[0] === "string") {
-    output = (outputRaw as string[]).map((s) => Buffer.from(s, "binary"));
-  } else {
-    throw new Error("Formato de saída inesperado");
-  }
-  console.log("Número de imagens obtidas:", output.length);
-
-  // Seleciona o buffer da melhor imagem
-  let chosenBuffer: Buffer;
-  if (output.length > 1) {
-    chosenBuffer = output.reduce((prev, curr) =>
-      curr.length > prev.length ? curr : prev
-    );
-  } else {
-    chosenBuffer = output[0];
-  }
-  console.log("Buffer escolhido, tamanho:", chosenBuffer.length);
-
-  // Upload da imagem para o Cloudinary
-  const uploadStart = Date.now();
-  const cloudinaryForm = new FormData();
-  cloudinaryForm.append("file", chosenBuffer, "nail.png");
-  cloudinaryForm.append("upload_preset", process.env.CLOUDINARY_UPLOAD_PRESET!);
-
-  const uploadResponse = await fetch(
-    `https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload`,
+  // Chamada à Stability AI – endpoint para image-to-image inpainting
+  const stabilityStart = Date.now();
+  const response = await fetch(
+    "https://api.stability.ai/v1/generation/stable-diffusion-inpainting-v2-1/image-to-image",
     {
       method: "POST",
-      body: cloudinaryForm,
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": `Bearer ${process.env.NEXT_PUBLIC_STABILITY_API_KEY}`,
+      },
+      body: JSON.stringify({
+        init_image: base64Init,
+        mask_image: base64Mask,
+        text_prompts: [{ text: finalPrompt }],
+        cfg_scale: 7,
+        denoising_strength: 0.75,
+        height: 512,
+        width: 512,
+        samples: 1,
+        steps: 30,
+      }),
     }
   );
-  const uploadResult = await uploadResponse.json();
-  console.log(`Upload para o Cloudinary: ${Date.now() - uploadStart} ms`);
+  console.log(`Chamada ao Stability API: ${Date.now() - stabilityStart} ms`);
 
-  console.log(`processImage finalizado em ${Date.now() - overallStart} ms`);
-  return uploadResult.secure_url;
+  // Obter e tratar a resposta da API
+  const result = await response.json();
+  console.log("Resultado do Stability API:", result);
+
+  if (result.artifacts && result.artifacts.length > 0) {
+    const generatedImageBase64 = result.artifacts[0].base64;
+    console.log(`processImage finalizado em ${Date.now() - overallStart} ms`);
+    // Retorna a imagem gerada como data URL (que pode ser exibida diretamente)
+    return `data:image/png;base64,${generatedImageBase64}`;
+  } else {
+    throw new Error("Nenhuma imagem gerada pela Stability API");
+  }
 }
 
 // Configuração para permitir execuções de até 60 segundos
